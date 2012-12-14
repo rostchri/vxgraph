@@ -1,255 +1,18 @@
 require 'graphviz'
 require 'yaml'
+require 'rcommand'
+require 'gnegraph'
 
 module VXGraph
-
-  $vxdg = {}
-  $vxdmp = {}
-  $vxenclosure = {}
-
-
-  def ssh_execute(hostname,precmds,cmds,direct=false)
-    cache_last = []
-    begin
-      gateway = Net::SSH::Gateway.new('dskinst001', 'root', :verbose => Logger::ERROR)
-      gateway.ssh(hostname, "root", {:verbose => Logger::ERROR} ) do |ssh|
-
-        precmds.each_with_index do |command,index|
-          yield index, ssh.exec!(command)
-        end
-
-        cmds.each do |command|
-          ssh.open_channel do |channel|
-
-            # stderr
-            channel.on_extended_data do |channel,type,data|
-              data.each_line { |l| printf("### STD-ERROR @%d [CMD: %s]  %s\n", channel.local_id + precmds.size , command , l.chop) } if type==1 
-            end
-
-            # stdout
-            channel.on_data do |channel,data|
-              if data[-1] == "\n"
-                if cache_last[channel.local_id]
-                  if direct==false
-                    cache_last[channel.local_id]+=data
-                  else
-                    yield channel.local_id, cache_last[channel.local_id] + data
-                    cache_last[channel.local_id] = nil
-                  end 
-                else
-                  if direct==false
-                    cache_last[channel.local_id] = data
-                  else
-                    yield channel.local_id, data
-                  end 
-                end
-              else
-                # Falls hinten kein \n so ist die Zeile nicht komplett übermittelt und muss als Präfix für die nächste Zeile gecached werden    
-                cache_last[channel.local_id] ? cache_last[channel.local_id] += data : cache_last[channel.local_id] = data
-              end
-            end
-
-            # eof
-            channel.on_eof do |channel|
-              #printf("### EOF-CHAN: %d CMD: %s\n", channel.local_id, command)
-              yield channel.local_id, cache_last[channel.local_id] if direct==false
-            end
-
-            channel.exec command
-          end
-        end
-      end
-      gateway.shutdown!
-    rescue Net::SSH::HostKeyMismatch => e
-      puts "remembering new key: #{e.fingerprint}"
-      e.remember_host!
-      retry
-    rescue Exception => ex
-      printf("### ERROR: %s [%s]\n%s\n",ex.message, ex.class, ex.backtrace.join("\n"))
-    end
-  end
-
-  def parse_vxdisk(info)
-    linenumber = 0
-    dmpdev  = nil
-    #File.open("import/#{$hostname}/vxdisk.txt")
-    info.each_line  do |line| 
-      line.chomp!
-      linenumber+=1
-      begin
-        if line =~ /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+).*$/
-          dmpdev = $1
-          diskgroup = $4
-          unless $vxdmp[dmpdev].nil?
-	          if diskgroup =~ /\((.*)\)/
-              $vxdmp[dmpdev][:dg] = $1
-            elsif diskgroup != "-"
-              $vxdmp[dmpdev][:dg] = $diskgroup
-            end
-          end
-        else
-          printf("### PARSING-ERROR for line: %s\n",line)
-        end
-      rescue Exception => ex
-        printf "### ERROR %s %s\n", ex.message, ex.backtrace.join("\n")
-        exit 1
-      end
-    end
-  end
-
-  def parse_vxdmpadm_paths(info)
-    linenumber = 0
-    dmpdev  = nil
-    #File.open("import/#{$hostname}/vxdmpadm-paths.txt")
-    info.each_line do |line| 
-      line.chomp!
-      linenumber+=1
-      begin
-        if line[0] != "#" && line =~ /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+).*$/
-          dmpdev = $4 
-          if dmpdev != "DMPNODENAME" && ($vxdmp[dmpdev].nil? || $vxdmp[dmpdev][:path][$1].nil?)
-             $vxdmp[dmpdev] = {:dmpdev => dmpdev, :path => {}} if $vxdmp[dmpdev].nil?
-             $vxdmp[dmpdev][:enclosure] = $5
-             $vxdmp[dmpdev][:path][$1] = {:state => $2, :type => $3, :ctrl => $6, :attr => $7}
-             printf "### WARNING Following path to dmpdev %s is %s: %s \n", dmpdev, $2, $1 if $2 != "ENABLED(A)"
-          end
-        end
-      rescue Exception => ex
-        printf "### ERROR %s %s\n", ex.message, ex.backtrace.join("\n")
-        exit 1
-      end
-    end
-  end
-
-  def parse_vxdmpadm_dmpnodes(info)
-    linenumber = 0
-    dmpdev  = nil
-    #File.open("import/#{$hostname}/vxdmpadm-dmpnodes.txt")
-    info.each_line  do |line| 
-      line.chomp!
-      linenumber+=1
-      begin
-        if line =~ /^(\S+)\s+=\s+(.*)$/
-          dmpdev = $2  if $1 == "dmpdev"
-          printf "### WARNING Following dmpdev is %p: %p\n", $2, $vxdmp[dmpdev] if $1 == "state" && $2 != "enabled"
-          unless dmpdev.nil? || ["###path"].include?($1)
-            if $1 == "path"
-              pathinfo = $2
-              if pathinfo =~ /(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$/
-                $vxdmp[dmpdev][:path]={} if $vxdmp[dmpdev][:path].nil?
-                $vxdmp[dmpdev][:path][$1] = {:state => $2, :type => $3, :transport => $4, :ctrl => $5, :hwpath => $6, :aportID=> $7, :aportWWN => $8, :attr => $9 }
-                # printf("%p\n",$vxdmp[dmpdev][:path][$1])
-              else
-		            puts "### ERROR reading path-info: #{pathinfo}"
-              end
-            else
-             $vxenclosure[$2] = {:name => $2} if $1 == "enclosure" && $vxenclosure[$2].nil?
-	           $vxdmp[dmpdev]={} if $vxdmp[dmpdev].nil?
-             $vxdmp[dmpdev][$1.to_sym] = $2
-            end
-          end
-        end
-      rescue Exception => ex
-        printf "### ERROR %s %s\n", ex.message, ex.backtrace.join("\n")
-        #printf "### CONTEXT: dg=%s vol=%s plex=%s\n", dgname, volname, plexname
-        #printf "### FOR LINENUMBER: %d) %p\n", linenumber, line
-        exit 1
-      end
-    end
-  end
-
+  
+  include RCommand
+  include GneGraph
+  include GneGraph::Representation::Graphiz
+        
   def vxsize(size) 
     sprintf("%2.2f GB", size.to_i * 512 / (1024*1024*1000))
   end
 
-  def parse_vxprint(info)
-    dgname  = nil
-    volname = nil
-    plexname = nil
-    subvolumename = nil
-    linenumber = 0
-    #File.open("import/#{$hostname}/vxprint.txt")
-    info.each_line  do |line| 
-     line.chomp!
-     linenumber+=1
-     begin
-        if line =~ /^dg\s+(\S+)\s+(\S+)\s+.*/
-           dgname = $1
-           $vxdg[dgname] = {:name => dgname, :assoc => $2}
-           # printf "### Diskgroup %p\n", $vxdg[dgname]
-        end
-
-        if line =~ /^dm\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/
-           $vxdg[dgname][:dm] = {} if $vxdg[dgname][:dm].nil?
-           $vxdg[dgname][:dm][$1] = dm = {:name => $1, :assoc => $2, :size => $4}
-           #printf "### Diskmedia %p\n", dm
-        end
-
-        if line =~ /^v\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+.*/
-           volname = $1
-           layered = (volname =~ /.*-L\d*$/ && volname.gsub(/(.*)-L(\d*)$/,"\\1") == subvolumename.gsub(/(.*)-S(\d*)$/,"\\1")) ? true : false
-           # puts "### Part of layered volume found: #{volname}" if layered
-           $vxdg[dgname][:v] = {} if $vxdg[dgname][:v].nil?
-           $vxdg[dgname][:v][volname] = {:name => volname, :type => $2, :state => $3, :size => $4, :condition => $6 , :layered => layered }
-           # printf "### Volume %p\n", $vxdg[dgname][:v][volname]
-        end
-
-        if line =~ /^pl\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+.*/
-           plexname = $1
-           plex = {:name => plexname, :assoc => $2, :state => $3, :size => $4, :condition => $6}
-           if plex[:state] == "ENABLED"
-              $vxdg[dgname][:v][volname][:pl] = {} if $vxdg[dgname][:v][volname][:pl].nil?
-              $vxdg[dgname][:v][volname][:pl][plexname] = plex
-              # printf "### Plex %p\n", plex
-           else
-              $vxdg[dgname][:pl] = {} if $vxdg[dgname][:pl].nil?
-              $vxdg[dgname][:pl][plexname] = plex
-              printf "### WARNING Following Plex is disabled: %p\n", plex
-           end
-        end
-
-        if line =~ /^sv\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+.*/
-          subvolumename = $1
-          subvolume = {:name => subvolumename, :assoc => $2, :state => $3, :size => $4, :condition => $6}
-          # puts "### Layered volume found: #{subvolumename}"
-          unless $vxdg[dgname][:v][volname][:pl][$2].nil?
-            $vxdg[dgname][:v][volname][:pl][$2][:sv]=[] if $vxdg[dgname][:v][volname][:pl][$2][:sv].nil?
-            $vxdg[dgname][:v][volname][:pl][$2][:sv] << subvolume
-          end
-        end
-
-        if !plexname.nil? && line =~ /^sd\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+.*/
-          sd = {:name => $1, :assoc => $2, :state => $3, :size => $4} 
-          if $1 =~ /^(\S+)-(\S+)$/
-            sd[:dmpdev]=$1
-          end
-          if !$vxdg[dgname][:v].nil? && !$vxdg[dgname][:v][volname].nil? && !$vxdg[dgname][:v][volname][:pl].nil? && !$vxdg[dgname][:v][volname][:pl][plexname].nil? && $vxdg[dgname][:v][volname][:pl][plexname][:name] == sd[:assoc]
-            $vxdg[dgname][:v][volname][:pl][plexname][:sd] = [] if $vxdg[dgname][:v][volname][:pl][plexname][:sd].nil?
-            $vxdg[dgname][:v][volname][:pl][plexname][:sd] << sd
-            #printf "### Subdisk %p\n", sd
-          else
-            # Disabled plexes are not associated to a volume - instead they are associated to a diskgroup - now associate all subdisk too
-            unless $vxdg[dgname][:pl].nil? || $vxdg[dgname][:pl][plexname].nil?
-              $vxdg[dgname][:pl][plexname][:sd] = [] if $vxdg[dgname][:pl][plexname][:sd].nil?
-              $vxdg[dgname][:pl][plexname][:sd] << sd
-            else
-              # unused subdisks - no association to a volume or a plex
-              printf "### WARNING: UNUSED SUBDISK: %p \n", sd
-              $vxdg[dgname][:sd] = [] if $vxdg[dgname][:sd].nil?
-              $vxdg[dgname][:sd] << sd
-            end
-          end
-        end
-
-     rescue Exception => ex
-       printf "### ERROR %s %s\n", ex.message, ex.backtrace.join("\n")
-       printf "### CONTEXT: dg=%s vol=%s plex=%s\n", dgname, volname, plexname
-       printf "### FOR LINENUMBER: %d) %p\n", linenumber, line
-       exit 1
-     end
-    end
-  end
-  
   def plot_graphs
     # initialize new Graphviz graph
     GraphViz.digraph( :G ) do |graph|
@@ -488,29 +251,129 @@ module VXGraph
       graph.output(:png => "vxvm-#{$hostname}-#{Time.now.strftime('%Y%m%d%H%M')}.png")
     end  
   end
-  
-  def plot_for_host(hostname)
-    #$marked_luns = %w( 0014 0015 0016 0017 010e 0117 0118 011a 0024 0025 0026 0027 0028 1500 1501 116d 116f 1170 1171 1172 1173 1174 0035 0036 0037 0038 011e 003c 003d 003e 003f 0040 0041 0042 0043 1500 1501 1502 1503 1504 1505 1506 1507 1508 1509 150a 150b 150c 150d 1076 1516 1517 1518 1077 1078 1079 )
 
+  def plot_for_host(options)
+    #$marked_luns = %w( 0014 0015 0016 0017 010e 0117 0118 011a 0024 0025 0026 0027 0028 1500 1501 116d 116f 1170 1171 1172 1173 1174 0035 0036 0037 0038 011e 003c 003d 003e 003f 0040 0041 0042 0043 1500 1501 1502 1503 1504 1505 1506 1507 1508 1509 150a 150b 150c 150d 1076 1516 1517 1518 1077 1078 1079 )
     # vxprint -lp und type auswerten
     # später mal nutzen: vxprint -trL 
+    
+    g = graph :title => "Veritas-Disklayout fuer #{options[:host]}", :truecolor => false, :rankdir => "BT" do |layout|
+      rcommand options.merge!({:debug => true, :stdout => false}) do
+        add_group do
+          add_command :cmdline => "hostname"
+          add_command :cmdline => "date"
+          add_command :cmdline => "vxdctl enable"
+        end
+        add_group :order => :parallel do
+          dgname   = nil
+          volname  = nil
+          plexname = nil
+          add_command :id => :vxprint,  :cmdline => "vxprint" do |line|
+            if line =~ /^dg\s+(\S+)\s+(\S+)\s+.*/
+              layout.add_node :id => "dg_#{dgname = $1}", :title => "DG: #{dgname}", :assoc => $2, :goptions => {:shape => "oval"}
+            end
+            
+            if line =~ /^dm\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/
+               diskmedia = layout.add_node :id => "dm_#{$1}", :title => "DM: #{$1}", :assoc => $2, :size => $4, :dg => dgname, :goptions => {:shape => "polygon"}
+               layout.add_edge :source => diskmedia, :target => layout.node("dg_#{dgname}"), :weight => 5, :style => "dashed"
+            end
+            
+            if line =~ /^v\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+.*/
+               volname = $1
+               vol = {:assoc => $2, :size => $4, :dg => dgname, :type => $2, :state => $3, :size => $4, :condition => $6}
+               layered = (volname =~ /.*-L\d*$/ && volname.gsub(/(.*)-L(\d*)$/,"\\1") == subvolumename.gsub(/(.*)-S(\d*)$/,"\\1")) ? true : false
+               volume = layout.add_node({:id => "vol_#{volname}", :title => "VOL: #{volname}", :goptions => {:shape => "octagon"}}.merge!(vol).merge!(:layered => layered))
+               layout.add_edge :source => volume, :target => layout.node("dg_#{dgname}"), :weight => 5, :style => "dashed"
+            end
 
-    channel_output=[]
-    ssh_execute hostname, 
-                ["hostname", "date", "vxdctl enable"],
-                ["vxprint", "vxdisk -o alldgs list", "vxdmpadm list dmpnode all", "vxdmpadm getsubpaths"] do |channel,data|
-      channel_output[channel] = data
+            if line =~ /^pl\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+.*/
+               plexname = $1
+               plex = {:name => plexname, :assoc => $2, :state => $3, :size => $4, :condition => $6}
+               if plex[:state] == "ENABLED"
+                  # $vxdg[dgname][:v][volname][:pl] = {} if $vxdg[dgname][:v][volname][:pl].nil?
+                  # $vxdg[dgname][:v][volname][:pl][plexname] = plex
+                  # printf "### Plex %p\n", plex
+               else
+                  # $vxdg[dgname][:pl] = {} if $vxdg[dgname][:pl].nil?
+                  # $vxdg[dgname][:pl][plexname] = plex
+                  printf "### WARNING Following Plex is disabled: %p\n", plex
+               end
+               plex = layout.add_node({:id => "pl_#{plexname}", :title => "PL: #{plexname}",  :goptions => {:style => "dashed", :shape => "box"}}.merge!(plex))
+               layout.add_edge :source => plex, :target => layout.node("dg_#{dgname}"), :weight => 5, :style => "dashed"
+            end
+            
+           if !plexname.nil? && line =~ /^sd\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+.*/
+              sdname = $1
+              sd = {:assoc => $2, :state => $3, :size => $4} 
+              if $1 =~ /^(\S+)-(\S+)$/
+                sd[:dmpdev]=$1
+              end
+              subdisk = layout.add_node({:id => "sd_#{sdname}", :title => "SD: #{sdname}", :dg => dgname,  :goptions => {}}.merge!(sd))
+              layout.add_edge :source => subdisk, :target => layout.node("dg_#{dgname}"), :weight => 5, :style => "dashed"
+                # Disabled plexes are not associated to a volume - instead they are associated to a diskgroup - now associate all subdisk too
+                # unless $vxdg[dgname][:pl].nil? || $vxdg[dgname][:pl][plexname].nil?
+                #   $vxdg[dgname][:pl][plexname][:sd] = [] if $vxdg[dgname][:pl][plexname][:sd].nil?
+                #   $vxdg[dgname][:pl][plexname][:sd] << sd
+                # else
+                #   # unused subdisks - no association to a volume or a plex
+                #   printf "### WARNING: UNUSED SUBDISK: %p \n", sd
+                #   $vxdg[dgname][:sd] = [] if $vxdg[dgname][:sd].nil?
+                #   $vxdg[dgname][:sd] << sd
+                # end
+            end
+            
+          end
+          add_command :id => :vxdisk,   :cmdline => "vxdisk -o alldgs list" do |line|
+            if line =~ /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+).*$/
+              dmpdev = $1
+              diskgroup = $4
+              if layout.node("dm_#{dmpdev}").nil? && diskgroup =~ /\((.*)\)/
+                layout.add_node :id => "dm_#{dmpdev}", :title => "DM: #{dmpdev}", :dg => $1
+              end
+            end
+          end
+          # add_command :id => :dmpnode,  :cmdline => "vxdmpadm list dmpnode all" do |line|
+          #             if line =~ /^(\S+)\s+=\s+(.*)$/
+          #               dmpdev = $2  if $1 == "dmpdev"
+          #               #printf "### WARNING Following dmpdev is %p: %p\n", $2, $vxdmp[dmpdev] if $1 == "state" && $2 != "enabled"
+          #               unless dmpdev.nil? || ["###path"].include?($1)
+          #                 if $1 == "path"
+          #                   pathinfo = $2
+          #                   if pathinfo =~ /(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)$/
+          #                     unless layout.node("dm_#{dmpdev}").nil?
+          #                       printf "#{dmpdev}: %p\n", {:state => $2, :type => $3, :transport => $4, :ctrl => $5, :hwpath => $6, :aportID=> $7, :aportWWN => $8, :attr => $9 }
+          #                     else
+          #                       puts dmpdev
+          #                     end
+          #                   else
+          #                     puts "### ERROR reading path-info: #{pathinfo}"
+          #                   end
+          #                 else
+          #                   #puts "not path: #{$1} #{$2}"
+          #                  #$vxenclosure[$2] = {:name => $2} if $1 == "enclosure" && $vxenclosure[$2].nil?
+          #                  #$vxdmp[dmpdev]={} if $vxdmp[dmpdev].nil?
+          #                  #$vxdmp[dmpdev][$1.to_sym] = $2
+          #                 end
+          #               else
+          #               end
+          #             end
+          #           end
+          add_command :id => :subpaths, :cmdline => "vxdmpadm getsubpaths" do |line|
+            if line[0] != "#" && line =~ /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+).*$/
+              dmpdev = $4 
+              if dmpdev != "DMPNODENAME" #&& ($vxdmp[dmpdev].nil? || $vxdmp[dmpdev][:path][$1].nil?)
+                 unless layout.node("dm_#{dmpdev}").nil?
+                   layout.node("dm_#{dmpdev}").options[:enclosure] = $5
+                   layout.node("dm_#{dmpdev}").options[:path] = {:state => $2, :type => $3, :ctrl => $6, :attr => $7}
+                 end
+              end
+            end
+          end
+        end
+      end
     end
-
-    # #puts YAML::dump($vxdmp)
-    # #puts YAML::dump($vxdg)
-    # #puts YAML::dump($vxenclosure)
-
-    parse_vxdmpadm_dmpnodes channel_output[5]
-    parse_vxdmpadm_paths channel_output[6]
-    parse_vxprint channel_output[3]
-    parse_vxdisk channel_output[4]
-    plot_graphs
+    puts g.to_s(:include_children => true)
+    plot(g,"test.png")
   end
   
 end

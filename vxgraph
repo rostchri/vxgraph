@@ -1,0 +1,21 @@
+#!/usr/bin/env ruby
+
+require "rubygems"
+require "bundler/setup"
+require "vxgraph"
+
+include VXGraph
+
+username      = ARGV[0]
+hostname      = ARGV[1]
+gateway_user  = ARGV[2]
+gateway_host  = ARGV[3]
+
+if username.nil? || hostname.nil?
+   puts "### Usage: #{$0} <username> <hostname> [<gateway>]"
+   exit 1
+else
+   options = {:host => hostname, :username => username}
+   options.merge!({:gateway => {:host => gateway_host, :username => gateway_user}}) unless gateway_host.nil? || gateway_user.nil?
+   VXGraph::plot_for_host(options)
+end
